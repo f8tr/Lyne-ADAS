@@ -31,59 +31,43 @@ data class TierProfile(
     val inferenceQueueDepth: Int = 1,
 ) {
     companion object {
-        val TIER_A = TierProfile(
-            tier = DeviceTier.A,
-            inputResolution = 384,
-            targetFps = 30,
-            objectCadence = 1,
-            laneCadence = 2,
-            signCadence = 5,
-            backendPreference = BackendPreference.NNAPI_THEN_GPU,
-            inferenceThreads = 4,
-            pixelFormat = PixelFormat.ARGB_8888,
-            useNanoModels = false,
-            useSegModel = true,
-            allowDashcam = true,
-            features = FeatureFlags.ALL,
-        )
-
-        val TIER_B = TierProfile(
+        /**
+         * Dashcam profile for a Galaxy A30s (Exynos 7904: no NPU, weak NNAPI) running continuous
+         * 720p loop recording next to the detector. Used for EVERY tier so the result does not
+         * depend on what the capability probe decides.
+         *
+         *  - XNNPACK on CPU only, 4 threads (no NNAPI / GPU attempts).
+         *  - Detector input 256 with the bundled nano YOLOv8n (the known-good light model).
+         *    To try 320 you need a 320-input .tflite exported and bundled first; then change
+         *    [inputResolution] here and make sure DetectorProvider loads that file.
+         *  - Neural segmentation, lane detection and traffic-sign recognition are OFF.
+         *    FCW / pedestrians+two-wheelers / headway stay ON (they only need object detection).
+         */
+        private val DASHCAM = TierProfile(
             tier = DeviceTier.B,
             inputResolution = 256,
             targetFps = 15,
             objectCadence = 1,
-            laneCadence = 1,        // seg runs async on its own thread; busy-guard throttles it
-            signCadence = 8,
-            backendPreference = BackendPreference.NNAPI_THEN_GPU,
-            inferenceThreads = 2,
-            pixelFormat = PixelFormat.ARGB_8888,
-            useNanoModels = true,   // 256-input YOLOv8n -> ~35% less compute than 320 for faster FPS
-            useSegModel = true,
-            allowDashcam = true,
-            features = FeatureFlags.ALL,
-        )
-
-        val TIER_C = TierProfile(
-            tier = DeviceTier.C,
-            inputResolution = 256,
-            targetFps = 8,
-            objectCadence = 1,
-            laneCadence = 6,
-            signCadence = 0, // TSR off on entry devices
+            laneCadence = 0,        // lane / drivable-area segmentation disabled
+            signCadence = 0,        // traffic-sign recognition disabled
             backendPreference = BackendPreference.XNNPACK_ONLY,
-            inferenceThreads = 2,
-            pixelFormat = PixelFormat.RGB_565,
+            inferenceThreads = 4,
+            pixelFormat = PixelFormat.ARGB_8888,
             useNanoModels = true,
-            useSegModel = false,    // entry devices: lighter classical segmenter
-            allowDashcam = false,
+            useSegModel = false,
+            allowDashcam = true,
             features = FeatureFlags(
                 fcw = true,
                 vru = true,
-                ldw = true,        // kept but on long cadence
+                ldw = false,
                 headway = true,
                 tsr = false,
             ),
         )
+
+        val TIER_A = DASHCAM.copy(tier = DeviceTier.A)
+        val TIER_B = DASHCAM.copy(tier = DeviceTier.B)
+        val TIER_C = DASHCAM.copy(tier = DeviceTier.C)
 
         fun forTier(tier: DeviceTier): TierProfile = when (tier) {
             DeviceTier.A -> TIER_A

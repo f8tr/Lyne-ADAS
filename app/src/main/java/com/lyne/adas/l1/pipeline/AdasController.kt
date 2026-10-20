@@ -2,7 +2,13 @@ package com.lyne.adas.l1.pipeline
 
 import android.content.Context
 import android.content.Intent
+import android.media.AudioManager
+import android.media.ToneGenerator
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Size
+import android.widget.Toast
 import androidx.camera.view.PreviewView
 import androidx.core.content.FileProvider
 import androidx.lifecycle.LifecycleOwner
@@ -20,6 +26,7 @@ import com.lyne.adas.l1.config.SensitivityPreset
 import com.lyne.adas.l1.config.SettingsStore
 import com.lyne.adas.l1.fusion.AdasEvent
 import com.lyne.adas.l1.fusion.FusionEngine
+import com.lyne.adas.l1.fusion.LeadDepartureMonitor
 import com.lyne.adas.l1.inference.DetectorProvider
 import com.lyne.adas.l1.inference.DetectorSet
 import com.lyne.adas.l1.inference.InferenceScheduler
@@ -28,10 +35,11 @@ import com.lyne.adas.l1.logging.Log
 import com.lyne.adas.l1.perf.PerfMonitor
 import com.lyne.adas.l1.perf.ThermalManager
 import com.lyne.adas.l1.perf.TierSelector
-import com.lyne.adas.l1.recording.RingBufferRecorder
+import com.lyne.adas.l1.recording.LoopRecorder
 import com.lyne.adas.l1.sensors.LightSensor
 import com.lyne.adas.l1.sensors.LocationProvider
 import com.lyne.adas.l1.sensors.MotionProvider
+import com.lyne.adas.l1.sensors.PlatformSpeedProvider
 import java.io.File
 import java.util.ArrayDeque
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -64,6 +72,11 @@ class AdasController(
     private val alerts = AlertManager(context)
     private val camera = CameraController(context, lifecycleOwner)
 
+    // Platform GPS speed (no Play Services) + "front car moved" logic.
+    private val platformSpeed = PlatformSpeedProvider(context)
+    private val departure = LeadDepartureMonitor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     // Day/night
     private var dayNightMode: DayNightMode = settings.dayNightMode
     @Volatile private var nightAuto: Boolean = light.isNight
@@ -78,7 +91,7 @@ class AdasController(
     private var pool: ImageBuffers? = null
     private var analyzer: FrameAnalyzer? = null
     private var fusion: FusionEngine? = null
-    private var recorder: RingBufferRecorder? = null
+    private var loopRecorder: LoopRecorder? = null
     private var rovix: com.lyne.adas.l1.logging.RovixEventWriter? = null
 
     private var previewView: PreviewView? = null
@@ -92,6 +105,8 @@ class AdasController(
         if (started) return
         started = true
         previewView = preview
+        // Continuous dashcam: keep the screen on while the HUD is visible.
+        preview?.keepScreenOn = true
 
         val resolved = tierSelector.resolve()
         val profile = resolved.profile
@@ -107,6 +122,8 @@ class AdasController(
         session = DriveSession(System.currentTimeMillis())
 
         if (location.hasPermission()) location.start()
+        departure.reset()
+        platformSpeed.start()
         if (motion.available) motion.start()
         light.start { night -> nightAuto = night; pushNight() }
         thermal.start { multiplier, label ->
@@ -115,15 +132,17 @@ class AdasController(
             perf.thermal = label
         }
 
+        // Match the video orientation to the display the HUD is shown on.
+        preview?.display?.rotation?.let { loopRecorder?.setRotation(it) }
         val target = analysisTargetFor(profile.inputResolution)
         camera.start(
             previewView = preview,
             analyzer = analyzer!!,
             analysisTarget = target,
-            videoCapture = recorder?.buildUseCase(),
+            videoCapture = loopRecorder?.videoCapture,
             onReady = { pushBase(resolved.tier, resolved.probeSummary()) },
             onError = { t -> _state.value = _state.value.copy(error = t.message ?: "camera error", cameraReady = false) },
-            onDashcamBound = { ok -> if (ok) recorder?.onBound() else recorder?.onBindFailed() },
+            onDashcamBound = { ok -> handleDashcamBound(ok) },
         )
         pushBase(resolved.tier, resolved.probeSummary())
         Log.i(TAG, "started tier=${resolved.tier} obj=${detectors?.obj?.name} lane=${detectors?.lane?.name} sign=${detectors?.sign?.name}")
@@ -136,7 +155,9 @@ class AdasController(
         detectors = dets
         perf.backend = dets.obj.backend
         fusion = FusionEngine(config, profile.features)
-        recorder = RingBufferRecorder(context, config, profile)
+        loopRecorder = if (profile.allowDashcam) {
+            LoopRecorder(context = context, onStatus = { msg -> Log.w(TAG, msg) })
+        } else null
         rovix = if (config.emitRovixSidecar)
             com.lyne.adas.l1.logging.RovixEventWriter(context, resolved.tier, dets.obj.backend) else null
 
@@ -165,8 +186,13 @@ class AdasController(
             nowMs = nowMs,
         )
         alerts.onResult(result, nowMs)
+        // Lead-vehicle departure ("the car in front moved").
+        departure.beginFrame()
+        // DEPARTURE-FEED: for every detected vehicle (car/motorcycle/bus/truck) in [p] call
+        //   departure.offer(cx, w, h)   // normalized 0..1 box center-x, width, height
+        // (needs Perception's detection type - not wired yet).
+        if (departure.endFrame(SystemClock.elapsedRealtime(), platformSpeed.speedKmh())) playDepartureAlert()
         session?.tick(nowMs, location.speedMps, location.latitude, location.longitude, result.events)
-        if (result.topSeverity == com.lyne.adas.l1.fusion.Severity.CRITICAL) recorder?.onEvent()
         if (result.events.isNotEmpty()) {
             rovix?.let { w -> result.events.forEach(w::record) }
             synchronized(eventRing) {
@@ -308,6 +334,33 @@ class AdasController(
         _state.value = _state.value.copy(calibrated = calibration.isCalibrated)
     }
 
+    private fun handleDashcamBound(ok: Boolean) {
+        val rec = loopRecorder ?: return
+        if (ok) {
+            rec.start()
+            toast("الداش كام يسجّل الآن")
+        } else {
+            Log.w(TAG, "dashcam VideoCapture could not be bound together with Preview + Analysis")
+            toast("تعذّر تشغيل التسجيل مع هذه الكاميرا")
+        }
+    }
+
+    private fun toast(msg: String) {
+        mainHandler.post { Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
+    }
+
+    /** Double beep on the alarm stream when the car ahead starts moving. */
+    private fun playDepartureAlert() {
+        if (alerts.muted) return
+        try {
+            val tg = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+            tg.startTone(ToneGenerator.TONE_PROP_BEEP2, 600)
+            mainHandler.postDelayed({ tg.release() }, 1200L)
+        } catch (t: Throwable) {
+            Log.w(TAG, "departure alert failed", t)
+        }
+    }
+
     private fun restart() {
         if (!started) return
         stop()
@@ -320,10 +373,14 @@ class AdasController(
         // Persist the finished drive for trip history.
         session?.let { s -> if (s.hasData) runCatching { tripStore.save(s.toTrip(System.currentTimeMillis())) } }
         session = null
-        recorder?.stop(); recorder = null
+        // Stop the recording BEFORE unbinding so the last clip is finalized.
+        loopRecorder?.stop(); loopRecorder = null
         camera.stop()
         thermal.stop()
         location.stop()
+        platformSpeed.stop()
+        departure.reset()
+        previewView?.keepScreenOn = false
         motion.stop()
         light.stop()
         scheduler?.close()
@@ -337,6 +394,7 @@ class AdasController(
 
     fun release() {
         stop()
+        mainHandler.removeCallbacksAndMessages(null)
         camera.shutdown()
         alerts.close()
     }
